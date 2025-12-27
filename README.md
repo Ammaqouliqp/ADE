@@ -54,3 +54,37 @@ pip install -r requirements.txt
 ```bash
 pip install PyQt6 openpyxl
 ```
+
+---
+
+▶️ Usage
+1.	Run the ADE application:
+```bash
+python main.py
+```
+2.	Use File → Open DB to open an existing SQLite database file.
+3.	Select a table from the left panel to view its contents.
+4.	Double click any editable cell to modify its value. Press Enter to save.
+5.	Use the menus or right click options to:
+  o	Add / Delete rows
+  o	Add columns
+  o	Undo / Redo changes
+  o	Export to CSV / Excel
+  o	View ER diagram
+  o	Execute custom SQL queries
+
+```bash
+ADE/
+├── main.py                # Core application
+├── LICENSE                # Open source license
+├── README.md              # This documentation
+└── requirements.txt       # Dependency list
+```
+🙌 Contribution
+
+Contributions, bug reports, feature requests, and pull requests are welcome!
+Feel free to open issues or submit changes.
+---
+❤️ Acknowledgements
+
+Thanks to the open source community for PyQt6 and SQLite — enabling powerful GUIs with minimal setup.
