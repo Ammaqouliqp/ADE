@@ -66,12 +66,12 @@ python main.py
 3.	Select a table from the left panel to view its contents.
 4.	Double click any editable cell to modify its value. Press Enter to save.
 5.	Use the menus or right click options to:
-  o	Add / Delete rows
-  o	Add columns
-  o	Undo / Redo changes
-  o	Export to CSV / Excel
-  o	View ER diagram
-  o	Execute custom SQL queries
+  ✅	Add / Delete rows
+  ✅	Add columns
+  ✅	Undo / Redo changes
+  ✅	Export to CSV / Excel
+  ✅	View ER diagram
+  ✅  Execute custom SQL que
 
 ```bash
 ADE/
