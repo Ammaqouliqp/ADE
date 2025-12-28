@@ -6,6 +6,7 @@ from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from openpyxl import Workbook
 import json
+import traceback
 
 # =========================
 # LOG MANAGER
@@ -14,11 +15,13 @@ class LogManager:
     def __init__(self, widget):
         self.widget = widget
 
-    def info(self, msg):
-        self.widget.append(f"<span style='color:#6bff95'>{msg}</span>")
+    def log(self, message: str, error=False):
+        color = "#ff6b6b" if error else "#6bff95"
+        self.widget.append(f'<span style="color:{color}">{message}</span>')
 
-    def error(self, msg):
-        self.widget.append(f"<span style='color:#ff6b6b'>{msg}</span>")
+    def log_exception(self, exc: Exception):
+        tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.log(tb_str, error=True)
 
 
 # =========================
@@ -365,34 +368,64 @@ class MainWindow(QMainWindow):
         self.logger.info("Table exported to Excel")
 
     def export_sql(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export SQL", "", "SQL (*.sql)")
+        if not self.model:
+            self.logger.log("No table loaded", error=True)
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export SQL", "", "SQL Files (*.sql)"
+        )
         if not path:
             return
 
         table = self.model.table
-        cols = ", ".join(self.model.headers)
+
+        # Exclude rowid
+        columns = [c for c in self.model.headers if c != "rowid"]
+
+        def esc_ident(name: str) -> str:
+            return f'"{name.replace(chr(34), chr(34)*2)}"'
 
         with open(path, "w", encoding="utf-8") as f:
+            f.write("BEGIN TRANSACTION;\n")
+
+            col_list = ", ".join(esc_ident(c) for c in columns)
+
             for row in self.model.rows:
-                values = ", ".join(
-                    f"'{str(row[c]).replace(\"'\", \"''\")}'" if row[c] is not None else "NULL"
-                    for c in self.model.headers
+                values = []
+                for c in columns:
+                    val = row.get(c)
+                    if val is None:
+                        values.append("NULL")
+                    elif isinstance(val, (int, float)):
+                        values.append(str(val))
+                    else:
+                        escaped = str(val).replace("'", "''")
+                        values.append(f"'{escaped}'")
+
+                values_sql = ", ".join(values)
+
+                f.write(
+                    f"INSERT INTO {esc_ident(table)} ({col_list}) "
+                    f"VALUES ({values_sql});\n"
                 )
-                f.write(f"INSERT INTO {table} ({cols}) VALUES ({values});\n")
 
-        self.logger.info("Table exported to SQL")
+            f.write("COMMIT;\n")
+
+        self.logger.log("Table exported to SQL")
 
 
 
-        def export_json(self):
-            path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "JSON (*.json)")
-            if not path:
-                return
 
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self.model.rows, f, ensure_ascii=False, indent=2)
+    def export_json(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "JSON (*.json)")
+        if not path:
+            return
 
-            self.logger.info("Table exported to JSON")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.model.rows, f, ensure_ascii=False, indent=2)
+
+        self.logger.info("Table exported to JSON")
 
     def export_db_copy(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Database Copy", "", "SQLite (*.db)")
