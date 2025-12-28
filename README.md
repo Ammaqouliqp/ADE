@@ -1,90 +1,85 @@
-# ADE — SQLite GUI Manager
+# Advanced Database Editor (ADE)
 
-A desktop database management tool built with **PyQt6** and **SQLite**, designed for easy viewing and editing of SQLite databases. ADE allows you to browse tables, edit cell values directly, manage schema elements, export data, visualize schema relationships, and track change history — all within a single interface.
+ADE is a **safe, professional SQLite database editor** built with **Python and PyQt6**.
 
----
-
-## 🚀 Features
-
-### Table & Data Management
-- Load any SQLite database (`.db`, `.sqlite`)
-- Browse and select tables
-- View table records in a spreadsheet-like grid
-- Edit cell values inline with immediate save to database
-- Add or delete rows
-- Add new columns with type specification
-- Rename tables
-- Delete tables
-
-### User-Friendly Edit & Logging
-- Undo / Redo support (Ctrl+Z / Ctrl+Y)
-- Visual log panel for all actions (success and error)
-- Keyboard shortcuts for copy/paste (Ctrl+C / Ctrl+V)
-- Right‑click context menus for tables and table cells
-
-### Export & Schema Tools
-- Export tables to CSV
-- Export tables to Excel (`.xlsx`)
-- ER Diagram viewer showing table columns and foreign keys
-- SQL Console for executing custom SQL queries
+It is designed for developers who need **direct database control** while maintaining **data integrity**, **clarity**, and **predictability**.
 
 ---
 
-## 📦 Installation
+## Key Features
 
-1. Clone the repository:
+### Database Management
+- Open and inspect SQLite databases
+- List and manage tables
+- Rename and drop tables (with confirmation)
+
+### Data Editing
+- Inline cell editing
+- Add rows safely
+- Delete rows **only when a PRIMARY KEY exists**
+- Selection-based row operations
+
+### Schema Operations
+- Add columns
+- View table schema
+- SQLite-safe restrictions enforced
+
+### Export System
+- Export table to CSV
+- Export table to Excel (.xlsx)
+- Export table to SQL INSERT script
+- Export table to JSON
+- Export full database copy
+- Export full SQL dump
+
+### UI & UX
+- Context menus (right-click)
+- Dynamic action enabling/disabling
+- Detailed operation logs
+- Professional database-editor behavior
+
+---
+
+## Safety Philosophy
+
+ADE **never lies to the user**.
+
+If an operation:
+- Is unsafe
+- Is ambiguous
+- Is not supported by SQLite
+
+It will be **blocked and explained**.
+
+This is intentional.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- SQLite 3
+- PyQt6
+- openpyxl
+
+---
+
+## Installation
 
 ```bash
 git clone https://github.com/Ammaqouliqp/ADE.git
 cd ADE
-```
-2. Create and activate a Python virtual environment (optional but recommended):
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-```
-3. Install dependencies:
-```bash
 pip install -r requirements.txt
-```
-*If you don’t have a requirements.txt yet, install manually:
-```bash
-pip install PyQt6 openpyxl
+python Advanced_database_editor.py
 ```
 
----
-
-▶️ Usage
-1.	Run the ADE application:
-```bash
-python main.py
-```
-2.	Use File → Open DB to open an existing SQLite database file.
-3.	Select a table from the left panel to view its contents.
-4.	Double click any editable cell to modify its value. Press Enter to save.
-5.	Use the menus or right click options to:
-  ✅	Add / Delete rows
-  ✅	Add columns
-  ✅	Undo / Redo changes
-  ✅	Export to CSV / Excel
-  ✅	View ER diagram
-  ✅  Execute custom SQL que
-
+## Project Structure
 ```bash
 ADE/
-├── main.py                # Core application
-├── LICENSE                # Open source license
-├── README.md              # This documentation
-└── requirements.txt       # Dependency list
+├── Advanced_database_editor.py
+├── README.md
+├── CONTRIBUTING.md
+├── requirements.txt
+├── LICENSE
 ```
-🙌 Contribution
 
-Contributions, bug reports, feature requests, and pull requests are welcome!
-Feel free to open issues or submit changes.
----
-❤️ Acknowledgements
-
-Thanks to the open source community for PyQt6 and SQLite — enabling powerful GUIs with minimal setup.
