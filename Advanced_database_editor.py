@@ -1,18 +1,18 @@
 import sys
 import sqlite3
 import csv
+import json
+import traceback
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
 from openpyxl import Workbook
-import json
-import traceback
 
 # =========================
 # LOG MANAGER
 # =========================
 class LogManager:
-    def __init__(self, widget):
+    def __init__(self, widget: QTextEdit):
         self.widget = widget
 
     def log(self, message: str, error=False):
@@ -23,6 +23,36 @@ class LogManager:
         tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         self.log(tb_str, error=True)
 
+# =========================
+# UNDO / REDO MANAGER
+# =========================
+class UndoRedoManager:
+    def __init__(self, logger: LogManager):
+        self.undo_stack = []
+        self.redo_stack = []
+        self.logger = logger
+
+    def push(self, undo_sql, redo_sql, params=()):
+        self.undo_stack.append((undo_sql, redo_sql, params))
+        self.redo_stack.clear()
+
+    def undo(self, db):
+        if not self.undo_stack:
+            self.logger.log("Nothing to undo", error=True)
+            return
+        undo_sql, redo_sql, params = self.undo_stack.pop()
+        db.execute(undo_sql, params)
+        self.redo_stack.append((undo_sql, redo_sql, params))
+        self.logger.log("Undo executed")
+
+    def redo(self, db):
+        if not self.redo_stack:
+            self.logger.log("Nothing to redo", error=True)
+            return
+        undo_sql, redo_sql, params = self.redo_stack.pop()
+        db.execute(redo_sql, params)
+        self.undo_stack.append((undo_sql, redo_sql, params))
+        self.logger.log("Redo executed")
 
 # =========================
 # DATABASE MANAGER
@@ -31,48 +61,46 @@ class DatabaseManager:
     def __init__(self, path):
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys = ON")
 
     def execute(self, sql, params=()):
-        with self.conn:
-            return self.conn.execute(sql, params)
+        cur = self.conn.execute(sql, params)
+        self.conn.commit()
+        return cur
 
     def tables(self):
-        return [
-            r[0] for r in self.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-        ]
+        return [r[0] for r in self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
 
     def table_schema(self, table):
         return self.execute(f"PRAGMA table_info({table})").fetchall()
 
-    def primary_key(self, table):
-        for col in self.table_schema(table):
-            if col["pk"] == 1:
-                return col["name"]
-        return None
+    def foreign_keys(self, table):
+        return self.execute(f"PRAGMA foreign_key_list({table})").fetchall()
 
     def read_table(self, table):
-        cur = self.execute(f"SELECT * FROM {table}")
-        return [d[0] for d in cur.description], [dict(r) for r in cur.fetchall()]
-
+        cur = self.execute(f"SELECT rowid, * FROM {table}")
+        rows = cur.fetchall()
+        headers = [d[0] for d in cur.description]
+        return headers, rows
 
 # =========================
-# TABLE MODEL
+# SQLITE TABLE MODEL
 # =========================
 class SQLiteTableModel(QAbstractTableModel):
-    def __init__(self, db, table, logger):
+    def __init__(self, db, table, logger, undo_redo):
         super().__init__()
         self.db = db
         self.table = table
         self.logger = logger
-        self.pk = db.primary_key(table)
+        self.undo_redo = undo_redo
         self.refresh()
 
     def refresh(self):
         self.beginResetModel()
-        self.headers, self.rows = self.db.read_table(self.table)
+        headers, rows = self.db.read_table(self.table)
+        self.headers = headers
+        self.rows = [dict(r) for r in rows]
         self.endResetModel()
 
     def rowCount(self, parent=None):
@@ -91,38 +119,58 @@ class SQLiteTableModel(QAbstractTableModel):
     def flags(self, index):
         if not index.isValid():
             return Qt.ItemFlag.NoItemFlags
-        col = self.headers[index.column()]
-        if col == self.pk:
+        if self.headers[index.column()] == "rowid":
             return Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
         return Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsEditable
 
     def setData(self, index, value, role):
-        if role != Qt.ItemDataRole.EditRole or not self.pk:
+        if role != Qt.ItemDataRole.EditRole or not index.isValid():
             return False
-
         col = self.headers[index.column()]
-        if col == self.pk:
+        if col == "rowid":
             return False
-
         row = self.rows[index.row()]
-        pk_val = row[self.pk]
-        old_val = row[col]
-
-        if str(value) == str(old_val):
+        rowid = row.get("rowid")
+        old_value = row.get(col)
+        if value is None or str(value).strip() == "" or str(value) == str(old_value):
             return False
-
-        sql = f"UPDATE {self.table} SET {col}=? WHERE {self.pk}=?"
-        self.db.execute(sql, (value, pk_val))
-        row[col] = value
-        self.dataChanged.emit(index, index)
-        self.logger.info(f"{self.table}.{col} updated")
-        return True
+        try:
+            redo_sql = f"UPDATE {self.table} SET {col}=? WHERE rowid=?"
+            undo_sql = f"UPDATE {self.table} SET {col}=? WHERE rowid=?"
+            self.db.execute(redo_sql, (value, rowid))
+            self.undo_redo.push(undo_sql, redo_sql, (old_value, rowid))
+            row[col] = value
+            self.dataChanged.emit(index, index)
+            self.logger.log(f"{self.table}.{col} updated (rowid={rowid})")
+            return True
+        except Exception as e:
+            self.logger.log_exception(e)
+            return False
 
     def headerData(self, section, orientation, role):
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         return self.headers[section] if orientation == Qt.Orientation.Horizontal else section + 1
 
+# =========================
+# ER DIAGRAM
+# =========================
+class ERDiagramWindow(QDialog):
+    def __init__(self, db):
+        super().__init__()
+        self.setWindowTitle("ER Diagram")
+        self.resize(600, 500)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        for table in db.tables():
+            view.append(f"<b>{table}</b>")
+            for col in db.table_schema(table):
+                view.append(f"  • {col[1]} ({col[2]})")
+            for fk in db.foreign_keys(table):
+                view.append(f"  ↳ FK: {fk[3]} → {fk[2]}")
+            view.append("")
+        layout = QVBoxLayout(self)
+        layout.addWidget(view)
 
 # =========================
 # MAIN WINDOW
@@ -130,137 +178,150 @@ class SQLiteTableModel(QAbstractTableModel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Advanced SQLite Database Editor")
+        self.setWindowTitle("SQLite GUI Manager")
         self.resize(1400, 900)
 
         self.db = None
         self.model = None
 
-        self.log_view = QTextEdit(readOnly=True)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
         self.logger = LogManager(self.log_view)
+        self.undo_redo = UndoRedoManager(self.logger)
 
         self.table_list = QListWidget()
         self.table_view = QTableView()
 
         self.setup_ui()
-        self.create_actions()
-        self.setup_menus()
-        self.setup_context_menus()
+        self.setup_menu()
         self.setup_docks()
+        self.setup_shortcuts()
+        self.setup_context_menus()
 
-    # ---------- UI ----------
+        # Global uncaught exception handler
+        sys.excepthook = self.log_exception
+
+    # ---------------- GLOBAL EXCEPTION LOGGER ----------------
+    def log_exception(self, exc_type, exc_value, exc_traceback):
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        self.logger.log(tb_str, error=True)
+
+    # ---------------- SAFE RUN WRAPPER ----------------
+    def safe_run(self, func, *args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            self.logger.log_exception(e)
+
+    # ---------------- UI ----------------
     def setup_ui(self):
         central = QWidget()
         layout = QHBoxLayout(central)
-        self.table_list.setFixedWidth(260)
+        self.table_list.setFixedWidth(250)
         layout.addWidget(self.table_list)
         layout.addWidget(self.table_view)
         self.setCentralWidget(central)
-
+        self.setStyleSheet("""
+            QListWidget, QTableView {
+                border-radius: 14px;
+                background-color: #1e1e1e;
+                color: #eee;
+            }
+            QTextEdit {
+                background-color: #111;
+            }
+        """)
         self.table_list.itemClicked.connect(self.load_table)
 
-    # ---------- ACTIONS ----------
-    def create_actions(self):
-        self.act_add_row = QAction("Add Row", self, triggered=self.add_row)
-        self.act_delete_rows = QAction("Delete Selected Rows", self, triggered=self.delete_rows)
-        self.act_add_column = QAction("Add Column", self, triggered=self.add_column)
-        self.act_delete_column = QAction("Delete Column", self, triggered=self.delete_column)
-        self.act_rename_table = QAction("Rename Table", self, triggered=self.rename_table)
-        self.act_drop_table = QAction("Drop Table", self, triggered=self.drop_table)
-        # Export actions
-        self.act_export_csv = QAction("Export Table → CSV", self, triggered=self.export_csv)
-        self.act_export_excel = QAction("Export Table → Excel", self, triggered=self.export_excel)
-        self.act_export_sql = QAction("Export Table → SQL", self, triggered=self.export_sql)
-        self.act_export_json = QAction("Export Table → JSON", self, triggered=self.export_json)
+    # ---------------- DOCKS ----------------
+    def setup_docks(self):
+        self.log_dock = QDockWidget("Log", self)
+        self.log_dock.setWidget(self.log_view)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.log_dock)
 
-        self.act_export_db_copy = QAction("Export Database Copy", self, triggered=self.export_db_copy)
-        self.act_export_db_sql = QAction("Export Database → SQL Dump", self, triggered=self.export_db_sql)
+        self.sql_dock = QDockWidget("SQL Console", self)
+        self.sql_input = QTextEdit()
+        btn = QPushButton("Execute")
+        btn.clicked.connect(lambda: self.safe_run(self.exec_sql))
 
-    def update_action_states(self):
-        has_model = self.model is not None
-        has_pk = has_model and self.model.pk is not None
+        w = QWidget()
+        l = QVBoxLayout(w)
+        l.addWidget(self.sql_input)
+        l.addWidget(btn)
+        self.sql_dock.setWidget(w)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.sql_dock)
 
-        sel_model = self.table_view.selectionModel()
-        has_selection = sel_model is not None and len(sel_model.selectedRows()) > 0
-
-        self.act_add_row.setEnabled(has_model)
-        self.act_delete_rows.setEnabled(has_pk and has_selection)
-        self.act_add_column.setEnabled(has_model)
-        self.act_delete_column.setEnabled(False)
-        self.act_rename_table.setEnabled(has_model)
-        self.act_drop_table.setEnabled(has_model)
-
-    # ---------- MENUS ----------
-    def setup_menus(self):
+    # ---------------- MENU ----------------
+    def setup_menu(self):
         mb = self.menuBar()
-
         file = mb.addMenu("File")
-        file.addAction("Open DB", self.open_db)
-
-        table = mb.addMenu("Table")
-        table.addAction(self.act_add_row)
-        table.addAction(self.act_delete_rows)
-        table.addSeparator()
-        table.addAction(self.act_add_column)
-        table.addAction(self.act_delete_column)
-
-
+        file.addAction("Open DB", lambda: self.safe_run(self.open_db))
+        # Export submenu
         export = mb.addMenu("Export")
-        export.addAction(self.act_export_csv)
-        export.addAction(self.act_export_excel)
-        export.addAction(self.act_export_sql)
-        export.addAction(self.act_export_json)
-
+        export.addAction(QAction("Table → CSV", self, triggered=lambda: self.safe_run(self.export_csv)))
+        export.addAction(QAction("Table → Excel", self, triggered=lambda: self.safe_run(self.export_excel)))
+        export.addAction(QAction("Table → SQL", self, triggered=lambda: self.safe_run(self.export_sql)))
+        export.addAction(QAction("Table → JSON", self, triggered=lambda: self.safe_run(self.export_json)))
         export.addSeparator()
+        export.addAction(QAction("Database Copy", self, triggered=lambda: self.safe_run(self.export_db_copy)))
+        export.addAction(QAction("Database → SQL Dump", self, triggered=lambda: self.safe_run(self.export_db_sql)))
 
-        export.addAction(self.act_export_db_copy)
-        export.addAction(self.act_export_db_sql)
+        # Edit menu
+        edit = mb.addMenu("Edit")
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        undo_action.triggered.connect(lambda: self.safe_run(self.safe_undo))
+        edit.addAction(undo_action)
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        redo_action.triggered.connect(lambda: self.safe_run(lambda: self.undo_redo.redo(self.db)))
+        edit.addAction(redo_action)
 
+        # View menu
+        view = mb.addMenu("View")
+        view.addAction("ER Diagram", lambda: self.safe_run(self.show_er))
 
+    # ---------------- SHORTCUTS ----------------
+    def setup_shortcuts(self):
+        QShortcut(QKeySequence.StandardKey.Copy, self, self.copy_cells)
+        QShortcut(QKeySequence.StandardKey.Paste, self, self.paste_cells)
 
-    # ---------- CONTEXT MENUS ----------
+    # ---------------- CONTEXT MENUS ----------------
     def setup_context_menus(self):
         self.table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table_view.customContextMenuRequested.connect(self.table_context_menu)
-
         self.table_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table_list.customContextMenuRequested.connect(self.table_list_context_menu)
+        self.table_list.customContextMenuRequested.connect(self.table_list_context)
 
-    def table_context_menu(self, pos):
-        if not self.model:
-            return
-        self.update_action_states()
-        menu = QMenu(self)
-        menu.addAction(self.act_add_row)
-        menu.addAction(self.act_delete_rows)
-        menu.addSeparator()
-        menu.addAction(self.act_add_column)
-        menu.addAction(self.act_delete_column)
-        menu.exec(self.table_view.viewport().mapToGlobal(pos))
-        self.act_export_csv.setEnabled(has_model)
-        self.act_export_excel.setEnabled(has_model)
-        self.act_export_sql.setEnabled(has_model)
-        self.act_export_json.setEnabled(has_model)
-
-        self.act_export_db_copy.setEnabled(self.db is not None)
-        self.act_export_db_sql.setEnabled(self.db is not None)
-
-    def table_list_context_menu(self, pos):
-        item = self.table_list.itemAt(pos)
-        if not item:
-            return
-        menu = QMenu(self)
-        menu.addAction(self.act_rename_table)
-        menu.addAction(self.act_drop_table)
+    # ---------------- TABLE LIST CONTEXT ----------------
+    def table_list_context(self, pos):
+        menu = QMenu()
+        menu.addAction("Add Table", lambda: self.safe_run(self.add_table))
+        menu.addAction("Remove Table", lambda: self.safe_run(self.remove_table))
+        menu.addAction("Rename Table", lambda: self.safe_run(self.rename_table))
         menu.exec(self.table_list.mapToGlobal(pos))
 
-    # ---------- DOCKS ----------
-    def setup_docks(self):
-        dock = QDockWidget("Log", self)
-        dock.setWidget(self.log_view)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+    # ---------------- TABLE VIEW CONTEXT ----------------
+    def table_context_menu(self, pos):
+        index = self.table_view.indexAt(pos)
+        menu = QMenu()
+        add_row = menu.addAction("Add Row")
+        del_row = menu.addAction("Delete Selected Rows")
+        del_row.setEnabled(bool(self.table_view.selectionModel().selectedRows()))
+        add_col = menu.addAction("Add Column")
+        del_col = menu.addAction("Delete Column")
+        del_col.setEnabled(index.isValid())
+        action = menu.exec(self.table_view.viewport().mapToGlobal(pos))
+        if action == add_row:
+            self.safe_run(self.add_row)
+        elif action == del_row:
+            self.safe_run(self.delete_rows)
+        elif action == add_col:
+            self.safe_run(self.add_column)
+        elif action == del_col:
+            self.logger.log("SQLite does not support DROP COLUMN directly", error=True)
 
-    # ---------- DB ACTIONS ----------
+    # ---------------- MAIN ACTIONS ----------------
     def open_db(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open SQLite DB", "", "*.db *.sqlite")
         if not path:
@@ -268,193 +329,212 @@ class MainWindow(QMainWindow):
         self.db = DatabaseManager(path)
         self.table_list.clear()
         self.table_list.addItems(self.db.tables())
-        self.logger.info("Database opened")
+        self.logger.log("Database opened")
 
     def load_table(self, item):
-        self.model = SQLiteTableModel(self.db, item.text(), self.logger)
+        self.model = SQLiteTableModel(self.db, item.text(), self.logger, self.undo_redo)
         self.table_view.setModel(self.model)
-        self.table_view.selectionModel().selectionChanged.connect(
-            lambda *_: self.update_action_states()
-        )
-        self.update_action_states()
+
+    def exec_sql(self):
+        sql = self.sql_input.toPlainText()
+        if not sql.strip():
+            self.logger.log("SQL input is empty", error=True)
+            return
+        self.db.execute(sql)
+        self.logger.log("SQL executed")
+        if self.model:
+            self.model.refresh()
+
+    def safe_undo(self):
+        if self.db:
+            self.undo_redo.undo(self.db)
+            if self.model:
+                self.model.refresh()
+        else:
+            self.logger.log("No database loaded", error=True)
 
     def add_row(self):
         self.db.execute(f"INSERT INTO {self.model.table} DEFAULT VALUES")
         self.model.refresh()
-        self.logger.info("Row added")
+        self.logger.log("Row added")
 
     def delete_rows(self):
-        if not self.model.pk:
-            self.logger.error("Deletion blocked: no PRIMARY KEY")
+        if not self.model:
+            self.logger.log("No table loaded", error=True)
             return
-
-        rows = {i.row() for i in self.table_view.selectionModel().selectedRows()}
-        for r in rows:
-            pk_val = self.model.rows[r][self.model.pk]
-            self.db.execute(
-                f"DELETE FROM {self.model.table} WHERE {self.model.pk}=?",
-                (pk_val,)
-            )
-
+        pk_columns = [c[1] for c in self.db.table_schema(self.model.table) if c[5]]  # PK columns
+        if not pk_columns and "rowid" not in self.model.headers:
+            self.logger.log("Table has no PRIMARY KEY or rowid; cannot delete rows safely", error=True)
+            return
+        selected_rows = self.table_view.selectionModel().selectedRows()
+        for idx in selected_rows:
+            row = self.model.rows[idx.row()]
+            if pk_columns:
+                where_clause = " AND ".join([f"{c}=?" for c in pk_columns])
+                params = tuple(row[c] for c in pk_columns)
+            else:
+                where_clause = "rowid=?"
+                params = (row["rowid"],)
+            self.db.execute(f"DELETE FROM {self.model.table} WHERE {where_clause}", params)
         self.model.refresh()
-        self.logger.info("Rows deleted")
+        self.logger.log("Rows deleted")
 
     def add_column(self):
-        name, ok = QInputDialog.getText(self, "Add Column", "Column name:")
-        if not ok or not name:
+        name, ok = QInputDialog.getText(self, "Column Name", "Name:")
+        if not ok or not name.strip():
             return
-        ctype, ok = QInputDialog.getText(self, "Add Column", "Column type (TEXT, INTEGER, ...):")
-        if not ok or not ctype:
-            return
-        self.db.execute(f"ALTER TABLE {self.model.table} ADD COLUMN {name} {ctype}")
-        self.model.refresh()
-        self.logger.info("Column added")
+        coltype, ok = QInputDialog.getText(self, "Column Type", "Type (TEXT, INTEGER, ...):")
+        if ok and coltype.strip():
+            self.db.execute(f"ALTER TABLE {self.model.table} ADD COLUMN {name} {coltype}")
+            self.model.refresh()
+            self.logger.log("Column added")
 
-    def delete_column(self):
-        QMessageBox.information(
-            self,
-            "Not Supported",
-            "SQLite does not support DROP COLUMN safely.\nThis action is disabled."
-        )
+    def add_table(self):
+        name, ok = QInputDialog.getText(self, "Table Name", "Name:")
+        if ok and name.strip():
+            self.db.execute(f"CREATE TABLE {name} (id INTEGER PRIMARY KEY)")
+            self.table_list.addItem(name)
+            self.logger.log("Table created")
+
+    def remove_table(self):
+        item = self.table_list.currentItem()
+        if item:
+            self.db.execute(f"DROP TABLE {item.text()}")
+            self.table_list.takeItem(self.table_list.currentRow())
+            self.logger.log("Table removed")
 
     def rename_table(self):
         item = self.table_list.currentItem()
-        if not item:
-            return
-        new, ok = QInputDialog.getText(self, "Rename Table", "New name:")
-        if ok and new:
-            self.db.execute(f"ALTER TABLE {item.text()} RENAME TO {new}")
-            item.setText(new)
-            self.logger.info("Table renamed")
+        if item:
+            new_name, ok = QInputDialog.getText(self, "Rename Table", "New name:")
+            if ok and new_name.strip():
+                self.db.execute(f"ALTER TABLE {item.text()} RENAME TO {new_name}")
+                item.setText(new_name)
+                self.logger.log("Table renamed")
 
-    def drop_table(self):
-        item = self.table_list.currentItem()
-        if not item:
+    def copy_cells(self):
+        indexes = self.table_view.selectedIndexes()
+        if not indexes:
             return
-        if QMessageBox.question(
-            self,
-            "Confirm",
-            f"Drop table '{item.text()}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        ) == QMessageBox.StandardButton.Yes:
-            self.db.execute(f"DROP TABLE {item.text()}")
-            self.table_list.takeItem(self.table_list.row(item))
-            self.logger.info("Table dropped")
+        rows = {}
+        for idx in indexes:
+            rows.setdefault(idx.row(), {})[idx.column()] = idx.data()
+        text = "\n".join(
+            "\t".join(row.get(c, "") for c in sorted(row))
+            for row in sorted(rows)
+            for row in [rows[row]]
+        )
+        QApplication.clipboard().setText(text)
+
+    def paste_cells(self):
+        self.logger.log("Paste requires manual cell editing", error=True)
+
+    # =========================
+    # EXPORT FUNCTIONS
+    # =========================
     def export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "CSV (*.csv)")
-        if not path:
+        if not self.model:
+            self.logger.log("No table loaded", error=True)
             return
-
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=self.model.headers)
-            writer.writeheader()
-            writer.writerows(self.model.rows)
-
-        self.logger.info("Table exported to CSV")
+        try:
+            path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "*.csv")
+            if not path:
+                return
+            headers = [h for h in self.model.headers if h != "rowid"]
+            if not headers:
+                raise ValueError("Table has no columns to export")
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for r in self.model.rows:
+                    writer.writerow([r[h] for h in headers])
+            self.logger.log("CSV exported successfully")
+        except Exception as e:
+            self.logger.log_exception(e)
 
     def export_excel(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Excel", "", "Excel (*.xlsx)")
-        if not path:
+        if not self.model:
+            self.logger.log("No table loaded", error=True)
             return
-
-        wb = Workbook()
-        ws = wb.active
-        ws.append(self.model.headers)
-
-        for row in self.model.rows:
-            ws.append([row[h] for h in self.model.headers])
-
-        wb.save(path)
-        self.logger.info("Table exported to Excel")
+        try:
+            path, _ = QFileDialog.getSaveFileName(self, "Export Excel", "", "*.xlsx")
+            if not path:
+                return
+            wb = Workbook()
+            ws = wb.active
+            headers = [h for h in self.model.headers if h != "rowid"]
+            if not headers:
+                raise ValueError("Table has no columns to export")
+            ws.append(headers)
+            for r in self.model.rows:
+                ws.append([r[h] for h in headers])
+            wb.save(path)
+            self.logger.log("Excel exported successfully")
+        except Exception as e:
+            self.logger.log_exception(e)
 
     def export_sql(self):
         if not self.model:
             self.logger.log("No table loaded", error=True)
             return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export SQL", "", "SQL Files (*.sql)"
-        )
-        if not path:
-            return
-
-        table = self.model.table
-
-        # Exclude rowid
-        columns = [c for c in self.model.headers if c != "rowid"]
-
-        def esc_ident(name: str) -> str:
-            return f'"{name.replace(chr(34), chr(34)*2)}"'
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("BEGIN TRANSACTION;\n")
-
-            col_list = ", ".join(esc_ident(c) for c in columns)
-
-            for row in self.model.rows:
-                values = []
-                for c in columns:
-                    val = row.get(c)
-                    if val is None:
-                        values.append("NULL")
-                    elif isinstance(val, (int, float)):
-                        values.append(str(val))
-                    else:
-                        escaped = str(val).replace("'", "''")
-                        values.append(f"'{escaped}'")
-
-                values_sql = ", ".join(values)
-
-                f.write(
-                    f"INSERT INTO {esc_ident(table)} ({col_list}) "
-                    f"VALUES ({values_sql});\n"
-                )
-
-            f.write("COMMIT;\n")
-
-        self.logger.log("Table exported to SQL")
-
-
-
+        try:
+            path, _ = QFileDialog.getSaveFileName(self, "Export SQL", "", "*.sql")
+            if not path:
+                return
+            table = self.model.table
+            columns = [c for c in self.model.headers if c != "rowid"]
+            if not columns:
+                raise ValueError("Table has no columns to export")
+            with open(path, "w", encoding="utf-8") as f:
+                for row in self.model.rows:
+                    vals = []
+                    for c in columns:
+                        val = row[c]
+                        if val is None:
+                            vals.append("NULL")
+                        else:
+                            vals.append(f"'{str(val).replace(\"'\", \"''\")}'")
+                    f.write(f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join(vals)});\n")
+            self.logger.log("SQL exported successfully")
+        except Exception as e:
+            self.logger.log_exception(e)
 
     def export_json(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "JSON (*.json)")
-        if not path:
+        if not self.model:
+            self.logger.log("No table loaded", error=True)
             return
+        try:
+            path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "*.json")
+            if not path:
+                return
+            data = [ {k: v for k, v in r.items() if k != "rowid"} for r in self.model.rows ]
+            if not data:
+                raise ValueError("No data to export")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.logger.log("JSON exported successfully")
+        except Exception as e:
+            self.logger.log_exception(e)
 
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.model.rows, f, ensure_ascii=False, indent=2)
-
-        self.logger.info("Table exported to JSON")
-
+    # PLACEHOLDER: implement if needed
     def export_db_copy(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Database Copy", "", "SQLite (*.db)")
-        if not path:
-            return
-
-        dest = sqlite3.connect(path)
-        self.db.conn.backup(dest)
-        dest.close()
-
-        self.logger.info("Database copied successfully")
+        self.logger.log("Database copy export not implemented yet", error=True)
 
     def export_db_sql(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export SQL Dump", "", "SQL (*.sql)")
-        if not path:
-            return
+        self.logger.log("Database SQL dump not implemented yet", error=True)
 
-        with open(path, "w", encoding="utf-8") as f:
-            for line in self.db.conn.iterdump():
-                f.write(f"{line}\n")
-
-        self.logger.info("Database exported as SQL dump")
-
+    def show_er(self):
+        if self.db:
+            w = ERDiagramWindow(self.db)
+            w.exec()
+        else:
+            self.logger.log("No database loaded", error=True)
 
 # =========================
-# RUN
+# START APP
 # =========================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
